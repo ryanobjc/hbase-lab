@@ -1,0 +1,25 @@
+From bad756d14acaa7264e01e75479d76740de0faaf5 Mon Sep 17 00:00:00 2001
+From: Ryan Rawson <ryanobjc@gmail.com>
+Date: Mon, 8 Mar 2010 15:22:34 -0800
+Subject: [PATCH 3/3] fix build problem
+
+---
+ .../org/apache/hadoop/hbase/HBaseConfTool.java     |    2 +-
+ 1 files changed, 1 insertions(+), 1 deletions(-)
+
+diff --git src/java/org/apache/hadoop/hbase/HBaseConfTool.java src/java/org/apache/hadoop/hbase/HBaseConfTool.java
+index 5b9ad3f..a88c6c8 100644
+--- src/java/org/apache/hadoop/hbase/HBaseConfTool.java
++++ src/java/org/apache/hadoop/hbase/HBaseConfTool.java
+@@ -28,7 +28,7 @@ public class HBaseConfTool {
+     if (args.length < 1)
+       return;
+ 
+-    Configuration conf = HBaseConfiguration.create();
++    Configuration conf = new HBaseConfiguration();
+     System.out.println(conf.get(args[0]));
+   }
+ }
+-- 
+1.6.6
+

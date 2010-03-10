@@ -1,0 +1,568 @@
+From b7a0da407e98aae4e9630e5f92fc6b13993b0adc Mon Sep 17 00:00:00 2001
+From: Ryan Rawson <ryanobjc@gmail.com>
+Date: Fri, 5 Mar 2010 13:08:32 -0800
+Subject: [PATCH 1/3] HBASE-2147 - run zookeeper in the same jvm as master during non-distributed mode
+
+git-svn-id: https://svn.apache.org/repos/asf/hadoop/hbase/trunk@901030 13f79535-47bb-0310-9956-ffa450edef68
+
+Conflicts:
+
+	CHANGES.txt
+---
+ bin/start-hbase.sh                                 |    9 +
+ .../org/apache/hadoop/hbase/HBaseConfTool.java     |   34 +++
+ .../apache/hadoop/hbase/MiniZooKeeperCluster.java  |  220 ++++++++++++++++++++
+ .../org/apache/hadoop/hbase/master/HMaster.java    |   21 ++
+ .../apache/hadoop/hbase/MiniZooKeeperCluster.java  |  205 ------------------
+ 5 files changed, 284 insertions(+), 205 deletions(-)
+ create mode 100644 src/java/org/apache/hadoop/hbase/HBaseConfTool.java
+ create mode 100644 src/java/org/apache/hadoop/hbase/MiniZooKeeperCluster.java
+ delete mode 100644 src/test/org/apache/hadoop/hbase/MiniZooKeeperCluster.java
+
+diff --git bin/start-hbase.sh bin/start-hbase.sh
+index c1209e0..8487dec 100755
+--- bin/start-hbase.sh
++++ bin/start-hbase.sh
+@@ -39,7 +39,16 @@ then
+   exit $errCode
+ fi
+ 
++distMode=`$bin/hbase org.apache.hadoop.hbase.HBaseConfTool hbase.cluster.distributed`
++
++
++if [ $distMode == 'false' ] 
++then
++  echo "Non distributed mode startup"
++  "$bin"/hbase-daemon.sh start master
++else
+ "$bin"/hbase-daemons.sh --config "${HBASE_CONF_DIR}" start zookeeper
+ "$bin"/hbase-daemon.sh --config "${HBASE_CONF_DIR}" start master 
+ "$bin"/hbase-daemons.sh --config "${HBASE_CONF_DIR}" \
+   --hosts "${HBASE_REGIONSERVERS}" start regionserver
++fi
+diff --git src/java/org/apache/hadoop/hbase/HBaseConfTool.java src/java/org/apache/hadoop/hbase/HBaseConfTool.java
+new file mode 100644
+index 0000000..5b9ad3f
+--- /dev/null
++++ src/java/org/apache/hadoop/hbase/HBaseConfTool.java
+@@ -0,0 +1,34 @@
++/*
++ * Copyright 2010 The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package org.apache.hadoop.hbase;
++
++import org.apache.hadoop.conf.Configuration;
++
++public class HBaseConfTool {
++
++  public static void main(String args[]) {
++    if (args.length < 1)
++      return;
++
++    Configuration conf = HBaseConfiguration.create();
++    System.out.println(conf.get(args[0]));
++  }
++}
+diff --git src/java/org/apache/hadoop/hbase/MiniZooKeeperCluster.java src/java/org/apache/hadoop/hbase/MiniZooKeeperCluster.java
+new file mode 100644
+index 0000000..7d3a69c
+--- /dev/null
++++ src/java/org/apache/hadoop/hbase/MiniZooKeeperCluster.java
+@@ -0,0 +1,220 @@
++/*
++ * Copyright 2009 The Apache Software Foundation
++ *
++ * Licensed to the Apache Software Foundation (ASF) under one
++ * or more contributor license agreements.  See the NOTICE file
++ * distributed with this work for additional information
++ * regarding copyright ownership.  The ASF licenses this file
++ * to you under the Apache License, Version 2.0 (the
++ * "License"); you may not use this file except in compliance
++ * with the License.  You may obtain a copy of the License at
++ *
++ *     http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++package org.apache.hadoop.hbase;
++
++import java.io.BufferedReader;
++import java.io.File;
++import java.io.IOException;
++import java.io.InputStreamReader;
++import java.io.OutputStream;
++import java.io.Reader;
++import java.net.BindException;
++import java.net.Socket;
++
++import org.apache.commons.logging.Log;
++import org.apache.commons.logging.LogFactory;
++import org.apache.hadoop.fs.FileUtil;
++import org.apache.hadoop.hbase.zookeeper.ZooKeeperWrapper;
++import org.apache.zookeeper.server.NIOServerCnxn;
++import org.apache.zookeeper.server.ZooKeeperServer;
++import org.apache.zookeeper.server.persistence.FileTxnLog;
++
++/**
++ * TODO: Most of the code in this class is ripped from ZooKeeper tests. Instead
++ * of redoing it, we should contribute updates to their code which let us more
++ * easily access testing helper objects.
++ */
++public class MiniZooKeeperCluster {
++  private static final Log LOG = LogFactory.getLog(MiniZooKeeperCluster.class);
++
++  private static final int TICK_TIME = 2000;
++  private static final int CONNECTION_TIMEOUT = 30000;
++
++  private boolean started;
++  private int clientPort = 21810; // use non-standard port
++
++  private NIOServerCnxn.Factory standaloneServerFactory;
++  private int tickTime = 0;
++
++  /** Create mini ZooKeeper cluster. */
++  public MiniZooKeeperCluster() {
++    this.started = false;
++  }
++
++  public void setClientPort(int clientPort) {
++    this.clientPort = clientPort;
++  }
++
++  public void setTickTime(int tickTime) {
++    this.tickTime = tickTime;
++  }
++
++  // / XXX: From o.a.zk.t.ClientBase
++  private static void setupTestEnv() {
++    // during the tests we run with 100K prealloc in the logs.
++    // on windows systems prealloc of 64M was seen to take ~15seconds
++    // resulting in test failure (client timeout on first session).
++    // set env and directly in order to handle static init/gc issues
++    System.setProperty("zookeeper.preAllocSize", "100");
++    FileTxnLog.setPreallocSize(100);
++  }
++
++  /**
++   * @param baseDir
++   * @return ClientPort server bound to.
++   * @throws IOException
++   * @throws InterruptedException
++   */
++  public int startup(File baseDir) throws IOException,
++      InterruptedException {
++
++    setupTestEnv();
++
++    shutdown();
++
++    File dir = new File(baseDir, "zookeeper").getAbsoluteFile();
++    recreateDir(dir);
++
++    int tickTimeToUse;
++    if (this.tickTime > 0) {
++      tickTimeToUse = this.tickTime;
++    } else {
++      tickTimeToUse = TICK_TIME;
++    }
++    ZooKeeperServer server = new ZooKeeperServer(dir, dir, tickTimeToUse);
++    while (true) {
++      try {
++        standaloneServerFactory = new NIOServerCnxn.Factory(clientPort);
++      } catch (BindException e) {
++        LOG.info("Faild binding ZK Server to client port: " + clientPort);
++        //this port is already in use. try to use another
++        clientPort++;
++        continue;
++      }
++      break;
++    }
++    standaloneServerFactory.startup(server);
++
++    if (!waitForServerUp(clientPort, CONNECTION_TIMEOUT)) {
++      throw new IOException("Waiting for startup of standalone server");
++    }
++
++    started = true;
++
++    return clientPort;
++  }
++
++  private void recreateDir(File dir) throws IOException {
++    if (dir.exists()) {
++      FileUtil.fullyDelete(dir);
++    }
++    try {
++      dir.mkdirs();
++    } catch (SecurityException e) {
++      throw new IOException("creating dir: " + dir, e);
++    }
++  }
++
++  /**
++   * @throws IOException
++   */
++  public void shutdown() throws IOException {
++    if (!started) {
++      return;
++    }
++
++    standaloneServerFactory.shutdown();
++    if (!waitForServerDown(clientPort, CONNECTION_TIMEOUT)) {
++      throw new IOException("Waiting for shutdown of standalone server");
++    }
++
++    started = false;
++  }
++
++  // XXX: From o.a.zk.t.ClientBase
++  private static boolean waitForServerDown(int port, long timeout) {
++    long start = System.currentTimeMillis();
++    while (true) {
++      try {
++        Socket sock = new Socket("localhost", port);
++        try {
++          OutputStream outstream = sock.getOutputStream();
++          outstream.write("stat".getBytes());
++          outstream.flush();
++        } finally {
++          sock.close();
++        }
++      } catch (IOException e) {
++        return true;
++      }
++
++      if (System.currentTimeMillis() > start + timeout) {
++        break;
++      }
++      try {
++        Thread.sleep(250);
++      } catch (InterruptedException e) {
++        // ignore
++      }
++    }
++    return false;
++  }
++
++  // XXX: From o.a.zk.t.ClientBase
++  private static boolean waitForServerUp(int port, long timeout) {
++    long start = System.currentTimeMillis();
++    while (true) {
++      try {
++        Socket sock = new Socket("localhost", port);
++        BufferedReader reader = null;
++        try {
++          OutputStream outstream = sock.getOutputStream();
++          outstream.write("stat".getBytes());
++          outstream.flush();
++
++          Reader isr = new InputStreamReader(sock.getInputStream());
++          reader = new BufferedReader(isr);
++          String line = reader.readLine();
++          if (line != null && line.startsWith("Zookeeper version:")) {
++            return true;
++          }
++        } finally {
++          sock.close();
++          if (reader != null) {
++            reader.close();
++          }
++        }
++      } catch (IOException e) {
++        // ignore as this is expected
++        LOG.info("server localhost:" + port + " not up " + e);
++      }
++
++      if (System.currentTimeMillis() > start + timeout) {
++        break;
++      }
++      try {
++        Thread.sleep(250);
++      } catch (InterruptedException e) {
++        // ignore
++      }
++    }
++    return false;
++  }
++}
+diff --git src/java/org/apache/hadoop/hbase/master/HMaster.java src/java/org/apache/hadoop/hbase/master/HMaster.java
+index a80509f..bf7e69f 100644
+--- src/java/org/apache/hadoop/hbase/master/HMaster.java
++++ src/java/org/apache/hadoop/hbase/master/HMaster.java
+@@ -20,6 +20,7 @@
+ package org.apache.hadoop.hbase.master;
+ 
+ import java.io.IOException;
++import java.io.File;
+ import java.lang.management.ManagementFactory;
+ import java.lang.management.RuntimeMXBean;
+ import java.lang.reflect.Constructor;
+@@ -57,6 +58,7 @@ import org.apache.hadoop.hbase.LocalHBaseCluster;
+ import org.apache.hadoop.hbase.MasterNotRunningException;
+ import org.apache.hadoop.hbase.RemoteExceptionHandler;
+ import org.apache.hadoop.hbase.TableExistsException;
++import org.apache.hadoop.hbase.MiniZooKeeperCluster;
+ import org.apache.hadoop.hbase.client.Get;
+ import org.apache.hadoop.hbase.client.HBaseAdmin;
+ import org.apache.hadoop.hbase.client.Result;
+@@ -1234,6 +1236,25 @@ public class HMaster extends Thread implements HConstants, HMasterInterface,
+           }
+           // If 'local', defer to LocalHBaseCluster instance.
+           if (LocalHBaseCluster.isLocal(conf)) {
++            // TODO make zookeepercluster a field and do an orderly shutdown
++            MiniZooKeeperCluster zooKeeperCluster = new MiniZooKeeperCluster();
++            File zkDataPath = new File(conf.get("hbase.zookeeper.property.dataDir"));
++            int zkClientPort = conf.getInt("hbase.zookeeper.property.clientPort", 0);
++            if (zkClientPort == 0) {
++              throw new IOException("No config value for hbase.zookeeper.property.clientPort");
++            }
++
++            zooKeeperCluster.setTickTime(conf.getInt("hbase.zookeeper.property.tickTime", 3000));
++            zooKeeperCluster.setClientPort(zkClientPort);
++            int clientPort = zooKeeperCluster.startup(zkDataPath);
++            if (clientPort != zkClientPort) {
++              String errorMsg = "Couldnt start ZK at requested address of " +
++                  zkClientPort + ", instead got: " + clientPort + ". Aborting. Why? " +
++                  "Because clients (eg shell) wont be able to find this ZK quorum";
++              System.err.println(errorMsg);
++              throw new IOException(errorMsg);
++            }
++            conf.set("hbase.zookeeper.property.clientPort", Integer.toString(clientPort));
+             (new LocalHBaseCluster(conf)).startup();
+           } else {
+             Constructor<? extends HMaster> c =
+diff --git src/test/org/apache/hadoop/hbase/MiniZooKeeperCluster.java src/test/org/apache/hadoop/hbase/MiniZooKeeperCluster.java
+deleted file mode 100644
+index 5da7218..0000000
+--- src/test/org/apache/hadoop/hbase/MiniZooKeeperCluster.java
++++ /dev/null
+@@ -1,205 +0,0 @@
+-/**
+- * Copyright 2009 The Apache Software Foundation
+- *
+- * Licensed to the Apache Software Foundation (ASF) under one
+- * or more contributor license agreements.  See the NOTICE file
+- * distributed with this work for additional information
+- * regarding copyright ownership.  The ASF licenses this file
+- * to you under the Apache License, Version 2.0 (the
+- * "License"); you may not use this file except in compliance
+- * with the License.  You may obtain a copy of the License at
+- *
+- *     http://www.apache.org/licenses/LICENSE-2.0
+- *
+- * Unless required by applicable law or agreed to in writing, software
+- * distributed under the License is distributed on an "AS IS" BASIS,
+- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+- * See the License for the specific language governing permissions and
+- * limitations under the License.
+- */
+-package org.apache.hadoop.hbase;
+-
+-import java.io.BufferedReader;
+-import java.io.File;
+-import java.io.IOException;
+-import java.io.InputStreamReader;
+-import java.io.OutputStream;
+-import java.io.Reader;
+-import java.net.BindException;
+-import java.net.Socket;
+-
+-import org.apache.commons.logging.Log;
+-import org.apache.commons.logging.LogFactory;
+-import org.apache.hadoop.fs.FileUtil;
+-import org.apache.hadoop.hbase.zookeeper.ZooKeeperWrapper;
+-import org.apache.zookeeper.server.NIOServerCnxn;
+-import org.apache.zookeeper.server.ZooKeeperServer;
+-import org.apache.zookeeper.server.persistence.FileTxnLog;
+-
+-/**
+- * TODO: Most of the code in this class is ripped from ZooKeeper tests. Instead
+- * of redoing it, we should contribute updates to their code which let us more
+- * easily access testing helper objects.
+- */
+-public class MiniZooKeeperCluster {
+-  private static final Log LOG = LogFactory.getLog(MiniZooKeeperCluster.class);
+-
+-  // TODO: make this more configurable?
+-  private static final int TICK_TIME = 2000;
+-  private static final int CONNECTION_TIMEOUT = 30000;
+-
+-  private boolean started;
+-  private int clientPort = 21810; // use non-standard port
+-
+-  private NIOServerCnxn.Factory standaloneServerFactory;
+-
+-  /** Create mini ZooKeeper cluster. */
+-  public MiniZooKeeperCluster() {
+-    this.started = false;
+-  }
+-
+-  // / XXX: From o.a.zk.t.ClientBase
+-  private static void setupTestEnv() {
+-    // during the tests we run with 100K prealloc in the logs.
+-    // on windows systems prealloc of 64M was seen to take ~15seconds
+-    // resulting in test failure (client timeout on first session).
+-    // set env and directly in order to handle static init/gc issues
+-    System.setProperty("zookeeper.preAllocSize", "100");
+-    FileTxnLog.setPreallocSize(100);
+-  }
+-
+-  /**
+-   * @param baseDir
+-   * @return ClientPort server bound to.
+-   * @throws IOException
+-   * @throws InterruptedException
+-   */
+-  public int startup(File baseDir) throws IOException,
+-      InterruptedException {
+-    setupTestEnv();
+-
+-    shutdown();
+-
+-    File dir = new File(baseDir, "zookeeper").getAbsoluteFile();
+-    recreateDir(dir);
+-
+-    ZooKeeperServer server = new ZooKeeperServer(dir, dir, TICK_TIME);
+-    while (true) {
+-      try {
+-        standaloneServerFactory = new NIOServerCnxn.Factory(clientPort);
+-      } catch (BindException e) {
+-        LOG.info("Faild binding ZK Server to client port: " + clientPort);
+-        //this port is already in use. try to use another
+-        clientPort++;
+-        continue;
+-      }
+-      break;
+-    }
+-    standaloneServerFactory.startup(server);
+-
+-    if (!waitForServerUp(clientPort, CONNECTION_TIMEOUT)) {
+-      throw new IOException("Waiting for startup of standalone server");
+-    }
+-
+-    started = true;
+-
+-    return clientPort;
+-  }
+-
+-  private void recreateDir(File dir) throws IOException {
+-    if (dir.exists()) {
+-      FileUtil.fullyDelete(dir);
+-    }
+-    try {
+-      dir.mkdirs();
+-    } catch (SecurityException e) {
+-      throw new IOException("creating dir: " + dir, e);
+-    }
+-  }
+-
+-  /**
+-   * @throws IOException
+-   */
+-  public void shutdown() throws IOException {
+-    if (!started) {
+-      return;
+-    }
+-
+-    standaloneServerFactory.shutdown();
+-    if (!waitForServerDown(clientPort, CONNECTION_TIMEOUT)) {
+-      throw new IOException("Waiting for shutdown of standalone server");
+-    }
+-
+-    started = false;
+-  }
+-
+-  // XXX: From o.a.zk.t.ClientBase
+-  private static boolean waitForServerDown(int port, long timeout) {
+-    long start = System.currentTimeMillis();
+-    while (true) {
+-      try {
+-        Socket sock = new Socket("localhost", port);
+-        try {
+-          OutputStream outstream = sock.getOutputStream();
+-          outstream.write("stat".getBytes());
+-          outstream.flush();
+-        } finally {
+-          sock.close();
+-        }
+-      } catch (IOException e) {
+-        return true;
+-      }
+-
+-      if (System.currentTimeMillis() > start + timeout) {
+-        break;
+-      }
+-      try {
+-        Thread.sleep(250);
+-      } catch (InterruptedException e) {
+-        // ignore
+-      }
+-    }
+-    return false;
+-  }
+-
+-  // XXX: From o.a.zk.t.ClientBase
+-  private static boolean waitForServerUp(int port, long timeout) {
+-    long start = System.currentTimeMillis();
+-    while (true) {
+-      try {
+-        Socket sock = new Socket("localhost", port);
+-        BufferedReader reader = null;
+-        try {
+-          OutputStream outstream = sock.getOutputStream();
+-          outstream.write("stat".getBytes());
+-          outstream.flush();
+-
+-          Reader isr = new InputStreamReader(sock.getInputStream());
+-          reader = new BufferedReader(isr);
+-          String line = reader.readLine();
+-          if (line != null && line.startsWith("Zookeeper version:")) {
+-            return true;
+-          }
+-        } finally {
+-          sock.close();
+-          if (reader != null) {
+-            reader.close();
+-          }
+-        }
+-      } catch (IOException e) {
+-        // ignore as this is expected
+-        LOG.info("server localhost:" + port + " not up " + e);
+-      }
+-
+-      if (System.currentTimeMillis() > start + timeout) {
+-        break;
+-      }
+-      try {
+-        Thread.sleep(250);
+-      } catch (InterruptedException e) {
+-        // ignore
+-      }
+-    }
+-    return false;
+-  }
+-}
+-- 
+1.6.6
+
