@@ -1,0 +1,47 @@
+<?xml version="1.0"?>
+
+<project name="lab" default="compile">
+
+  <property name="hbase.home" location="../../hbase-0.20.3" />
+
+  <property name="src.dir" location="${basedir}/src" />
+  
+  <property name="build.dir" location="${basedir}/build" />
+
+  <property name="build.classes" location="${build.dir}/classes" />
+
+  <property name="javac.version" value="1.6" />
+
+  <path id="classpath">
+    <fileset dir="${hbase.home}">
+      <include name="lib/*.jar" />
+      <include name="*.jar" />
+      <include name="conf" />
+    </fileset>
+    <pathelement location="${build.classes}" />
+  </path>
+  
+  <target name="init">
+    <mkdir dir="${build.dir}" />
+    <mkdir dir="${build.classes}" />
+  </target>
+
+  <target name="classpath">
+    <property name="myclasspath" refid="classpath"/>
+    <echo message="classpath= ${myclasspath}"/>
+  </target>
+
+  <target name="compile" depends="init">
+    <javac
+      debug="yes"
+      srcdir="${src.dir}"
+      includes="**/*.java"
+      destdir="${build.classes}"
+      target="${javac.version}"
+      source="${javac.version}">
+      <classpath refid="classpath" />
+    </javac>
+  </target>
+
+  
+</project>
